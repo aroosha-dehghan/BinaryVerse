@@ -1,4 +1,9 @@
-# Combination
+"""
+Open Cluster Binary Stars Detection Framework
+Author: [Your Name/GitHub Username]
+Description: A multi-method pipeline to identify binary star candidates in 
+             open clusters using ESA Gaia space mission data.
+"""
 
 import os
 import glob
@@ -9,194 +14,186 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 import matplotlib.pyplot as plt
 from scipy.ndimage import uniform_filter1d
+from scipy.spatial import cKDTree
+
+def mad_to_sigma(x):
+    """
+    Robust standard deviation estimation using Median Absolute Deviation (MAD).
+    Standard standard deviation is sensitive to outliers (e.g., cluster non-members).
+    MAD multiplied by 1.4826 provides a resilient and unbiased estimate of Sigma.
+    """
+    x = np.asarray(x)
+    x = x[~np.isnan(x)]
+    if x.size == 0: 
+        return 0.02
+    median = np.median(x)
+    mad = np.median(np.abs(x - median))
+    return 1.4826 * mad
 
 
+def identify_binaries_pm_plx_fast(df, k_sigma_pm=3.0, k_sigma_plx=3.0, sep_thresh_pc=0.05):
+    """
+    Method 1: Proper Motion (PM) & Parallax (Plx) Coherence with Spatial Proximity
+    --------------------------------------------------------------------------
+    Astrophysical Logic:
+        Bound binary systems must share nearly identical spatial velocities (PM)
+        and distances (Parallax) due to their gravitational coupling.
+    Implementation:
+        1. Dynamically computes noise thresholds for PM and Plx using MAD.
+        2. Converts celestial coordinates (RA/Dec/Plx) into 3D Cartesian coordinates (pc).
+        3. Uses an ultra-fast cKDTree algorithm to find physically close pairs (O(N log N)).
+        4. Filters those close pairs to ensure their velocity and distance differences 
+           fall within the permitted statistical threshold.
+    """
+    cols = {"ra", "dec", "pmRA", "pmDE", "parallax"}
+    if not cols.issubset(df.columns) or len(df) < 2: 
+        return []
+    
+    # Calculate statistical thresholds using robust MAD
+    pm_mag = np.hypot(df["pmRA"].values, df["pmDE"].values)
+    pm_thresh = k_sigma_pm * mad_to_sigma(pm_mag)
+    plx_thresh = k_sigma_plx * mad_to_sigma(df["parallax"].values)
+    
+    # Get cluster median parallax to estimate distance scale
+    median_plx = np.nanmedian(df["parallax"].values)
+    if median_plx <= 0: 
+        return []
+    dist_pc = 1000.0 / median_plx
+    
+    # Convert spherical coordinates to 3D Cartesian space (parsecs)
+    ra_rad = np.deg2rad(df["ra"].values)
+    dec_rad = np.deg2rad(df["dec"].values)
+    x = dist_pc * np.cos(dec_rad) * np.cos(ra_rad)
+    y = dist_pc * np.cos(dec_rad) * np.sin(ra_rad)
+    z = dist_pc * np.sin(dec_rad)
+    coords_3d = np.vstack((x, y, z)).T
+    
+    # Build spatial tree to find close neighbors efficiently
+    tree = cKDTree(coords_3d)
+    pairs = tree.query_pairs(r=sep_thresh_pc)
+    
+    binary_indices = set()
+    pmRA, pmDE, plx = df["pmRA"].values, df["pmDE"].values, df["parallax"].values
+    
+    # Evaluate kinematics only for spatially close candidates
+    for i, j in pairs:
+        delta_pm = np.hypot(pmRA[i] - pmRA[j], pmDE[i] - pmDE[j])
+        if delta_pm <= pm_thresh:
+            if abs(plx[i] - plx[j]) <= plx_thresh:
+                binary_indices.update([df.index[i], df.index[j]])
+                
+    return list(binary_indices)
 
-# CMD
+
+def identify_binaries_direct_fast(df, sep_thresh_au=1000):
+    """
+    Method 2: Resolved Wide Binaries via Direct Angular Separation
+    --------------------------------------------------------------
+    Astrophysical Logic:
+        Targeting wide binary systems where Gaia resolves both components as distinct sources.
+    Implementation:
+        1. Projects 3D locations of all stars into parsecs.
+        2. Converts the separation threshold from Astronomical Units (AU) to parsecs.
+        3. Utilizes cKDTree to map and extract all pairs within the physical threshold.
+    """
+    cols = {"ra", "dec", "parallax"}
+    if not cols.issubset(df.columns) or len(df) < 2: 
+        return []
+    
+    median_plx = np.nanmedian(df["parallax"].values)
+    if median_plx <= 0: 
+        return []
+    dist_pc = 1000.0 / median_plx
+    
+    # Convert AU threshold to parsecs (1 pc = 206265 AU)
+    sep_thresh_pc = sep_thresh_au / 206265.0
+    
+    # Compute 3D Cartesian coordinates
+    ra_rad = np.deg2rad(df["ra"].values)
+    dec_rad = np.deg2rad(df["dec"].values)
+    x = dist_pc * np.cos(dec_rad) * np.cos(ra_rad)
+    y = dist_pc * np.cos(dec_rad) * np.sin(ra_rad)
+    z = dist_pc * np.sin(dec_rad)
+    coords_3d = np.vstack((x, y, z)).T
+    
+    # Query spatial tree for resolved pairs
+    tree = cKDTree(coords_3d)
+    pairs = tree.query_pairs(r=sep_thresh_pc)
+    
+    binary_indices = set()
+    for i, j in pairs:
+        binary_indices.update([df.index[i], df.index[j]])
+        
+    return list(binary_indices)
+
+
 def identify_binaries_cmd(df):
-    cols = {"phot_g_mean_mag","phot_bp_mean_mag","phot_rp_mean_mag","parallax"}
-    if not cols.issubset(df.columns):
+    """
+    Method 3: Color-Magnitude Diagram (CMD) Main-Sequence Over-luminosity
+    --------------------------------------------------------------------
+    Astrophysical Logic:
+        Unresolved binaries blend into a single point source. The combined flux 
+        makes the system brighter than a single star of the same color, shifting it 
+        up to 0.75 magnitudes above the single-star Main Sequence (MS).
+    Implementation:
+        1. Computes the color index (BP - RP) and the absolute G magnitude (M_G).
+        2. Uses a running uniform filter to fit and trace the empirical Main Sequence trend line.
+        3. Flags any star elevated by more than 0.3 magnitudes above the MS line as a binary.
+    """
+    cols = {"phot_g_mean_mag", "phot_bp_mean_mag", "phot_rp_mean_mag", "parallax"}
+    if not cols.issubset(df.columns): 
         return []
+    
     sub = df.dropna(subset=list(cols)).copy()
-    if sub.empty:
+    if sub.empty: 
         return []
+    
+    # Photometric calculations
     sub["bp_rp"] = sub["phot_bp_mean_mag"] - sub["phot_rp_mean_mag"]
     sub["distance_pc"] = 1000.0 / sub["parallax"]
-    sub["abs_mag_g"] = sub["phot_g_mean_mag"] - 5*np.log10(sub["distance_pc"]/10.0)
+    sub["abs_mag_g"] = sub["phot_g_mean_mag"] - 5 * np.log10(sub["distance_pc"] / 10.0)
+    
+    # Fit empirical Main Sequence using uniform filter
     sub_sorted = sub.sort_values("bp_rp")
-    smooth_size = min(50, max(5, len(sub_sorted)//5))
+    smooth_size = min(50, max(5, len(sub_sorted) // 5))
     main_seq = uniform_filter1d(sub_sorted["abs_mag_g"].values, size=smooth_size)
+    
+    # Delta magnitude (Positive means brighter than the MS line)
     sub_sorted["delta_mag"] = main_seq - sub_sorted["abs_mag_g"]
+    
+    # Threshold: stars elevated by > 0.3 mag are strong unresolved binary candidates
     binaries = sub_sorted[sub_sorted["delta_mag"] > 0.3]
     return list(binaries.index)
 
 
-
-
-# PM+Plx
-def identify_binaries_pm_plx(df, k_sigma_pm=3.0, k_sigma_plx=3.0, sep_thresh_pc=0.05):
-    cols = {"ra","dec","pmRA","pmDE","parallax"}
-    if not cols.issubset(df.columns):
+def identify_binaries_aen(df, col="astrometric_excess_noise", k_sigma=3):
+    """
+    Method 4: Astrometric Excess Noise (AEN) Anomalies
+    --------------------------------------------------
+    Astrophysical Logic:
+        Close, unresolved binaries orbit a moving center of charge/mass. This orbital 
+        wobble disrupts Gaia's standard single-star kinematic fit, producing a 
+        statistically significant residual known as Astrometric Excess Noise.
+    Implementation:
+        1. Filters out NaN values from the Gaia AEN data column.
+        2. Calculates the cluster's base astrometric noise level using MAD.
+        3. Identifies stars with an AEN higher than the cluster median + K*Sigma.
+    """
+    if col not in df.columns: 
         return []
-    n = len(df)
-    if n<2: return []
-    coords = SkyCoord(ra=df["ra"].values*u.deg, dec=df["dec"].values*u.deg)
-    pmRA = df["pmRA"].values
-    pmDE = df["pmDE"].values
-    pm_mag = np.hypot(pmRA, pmDE)
-    sigma_pm = 1.4826 * np.median(np.abs(pm_mag - np.nanmedian(pm_mag)))
-    if sigma_pm <=0 or not np.isfinite(sigma_pm): sigma_pm = 0.2
-    pm_thresh = k_sigma_pm * sigma_pm
-    plx = df["parallax"].values
-    sigma_plx = 1.4826 * np.median(np.abs(plx - np.nanmedian(plx)))
-    if sigma_plx <=0 or not np.isfinite(sigma_plx): sigma_plx = 0.05
-    plx_thresh = k_sigma_plx * sigma_plx
-    median_plx = np.nanmedian(plx)
-    if median_plx <=0 or not np.isfinite(median_plx): return []
-    distance_pc = 1000.0 / median_plx
-    pairs = []
-    for i in range(n):
-        for j in range(i+1,n):
-            dpm = np.hypot(pmRA[i]-pmRA[j], pmDE[i]-pmDE[j])
-            dplx = abs(plx[i]-plx[j])
-            sep_pc = coords[i].separation(coords[j]).to(u.rad).value * distance_pc
-            if dpm <= pm_thresh and dplx <= plx_thresh and sep_pc <= sep_thresh_pc:
-                pairs.append(df.index[i])
-                pairs.append(df.index[j])
-    return list(set(pairs))
-
-
-
-
-# AEN
-def identify_binaries_aen(df, col="inrt", k_sigma=3):
-    if col not in df.columns: return []
+    
     aen = df[col].values
     finite_mask = np.isfinite(aen)
-    if finite_mask.sum() == 0: return []
+    if finite_mask.sum() == 0: 
+        return []
+    
     aen_nonan = aen[finite_mask]
     med = np.median(aen_nonan)
-    mad = np.median(np.abs(aen_nonan - med))
-    sigma = 1.4826 * mad
-    if sigma <=0 or not np.isfinite(sigma): sigma = np.nanstd(aen_nonan) if np.nanstd(aen_nonan)>0 else 0.01
-    thr = med + k_sigma*sigma
-    sel = df[df[col]>thr]
-    return list(sel.index)
-
-
-# Direct Imaging
-def identify_binaries_direct(df, sep_thresh_au=1000):
-    cols = {"ra","dec","parallax"}
-    if not cols.issubset(df.columns): return []
-    n = len(df)
-    if n<2: return []
-    coords = SkyCoord(ra=df["ra"].values*u.deg, dec=df["dec"].values*u.deg)
-    median_plx = np.nanmedian(df["parallax"].values)
-    if median_plx <=0 or not np.isfinite(median_plx): return []
-    distance_pc = 1000.0 / median_plx
-    sep_thresh_pc = sep_thresh_au / 206265.0
-    pairs = []
-    for i in range(n):
-        for j in range(i+1,n):
-            sep_pc = coords[i].separation(coords[j]).to(u.rad).value * distance_pc
-            if sep_pc <= sep_thresh_pc:
-                pairs.append(df.index[i])
-                pairs.append(df.index[j])
-    return list(set(pairs))
-
-
-
-
-# cluster 
-def process_cluster(vot_path, save_dir):
-    cluster_id = os.path.splitext(os.path.basename(vot_path))[0]
-    print(f"\n🔄 Processing {cluster_id} ...")
-    try:
-        table = parse(vot_path).get_first_table().to_table()
-        df = table.to_pandas()
-    except Exception as e:
-        print(f"❌ Failed to parse {vot_path}: {e}")
-        return None
-
-    df = df.rename(columns={
-        "RA_ICRS":"ra","DE_ICRS":"dec",
-        "Plx":"parallax","Gmag":"phot_g_mean_mag",
-        "BPmag":"phot_bp_mean_mag","RPmag":"phot_rp_mean_mag"
-    })
-    df = df.dropna(subset=["ra","dec","parallax"]).copy()
-    if df.empty: return None
-    df = df.reset_index(drop=True)
-
-    cmd_ids = identify_binaries_cmd(df)
-    pm_ids = identify_binaries_pm_plx(df)
-    aen_ids = identify_binaries_aen(df)
-    dir_ids = identify_binaries_direct(df)
-
-    all_ids = set(cmd_ids) | set(pm_ids) | set(aen_ids) | set(dir_ids)
-    sets = {"cmd": set(cmd_ids), "pm": set(pm_ids), "aen": set(aen_ids), "dir": set(dir_ids)}
-
-
-
-    # Strong Candidates = detected by at least two methods
-    strong_ids = set()
-    keys = list(sets.keys())
-    for i in range(len(keys)):
-        for j in range(i+1, len(keys)):
-            strong_ids |= (sets[keys[i]] & sets[keys[j]])
-
-    df["is_strong"] = df.index.isin(strong_ids)
-
-    os.makedirs(save_dir, exist_ok=True)
-    out_csv = os.path.join(save_dir, f"{cluster_id}_binaries.csv")
-    if len(all_ids) > 0:
-        df.loc[sorted(all_ids)].to_csv(out_csv, index=False)
-        print("Saved candidates to:", out_csv)
-
-    # Plot
-    plt.figure(figsize=(7,7))
-    plt.scatter(df["ra"], df["dec"], s=2, c="lightgray", alpha=0.6, label="All stars")
-    if cmd_ids: plt.scatter(df.loc[cmd_ids,"ra"], df.loc[cmd_ids,"dec"], s=20, c="red", alpha=0.7, label="CMD")
-    if pm_ids: plt.scatter(df.loc[pm_ids,"ra"], df.loc[pm_ids,"dec"], s=20, c="orange", alpha=0.7, label="PM+Plx")
-    if aen_ids: plt.scatter(df.loc[aen_ids,"ra"], df.loc[aen_ids,"dec"], s=20, c="blue", alpha=0.7, label="AEN")
-    if dir_ids: plt.scatter(df.loc[dir_ids,"ra"], df.loc[dir_ids,"dec"], s=20, c="green", alpha=0.7, label="Direct sep")
-    for idx in strong_ids:
-        plt.scatter(df.loc[idx,"ra"], df.loc[idx,"dec"], s=200, facecolors='none', edgecolors='black', linewidths=1.2)
-        plt.text(df.loc[idx,"ra"], df.loc[idx,"dec"], str(idx), fontsize=8, color='black')
-
-    plt.xlabel("RA (deg)")
-    plt.ylabel("Dec (deg)")
-    plt.title(f"{cluster_id}: total_cand={len(all_ids)}, strong={len(strong_ids)}")
-    plt.legend(loc="best")
-    plt.tight_layout()
-    out_png = os.path.join(save_dir, f"{cluster_id}_binaries.png")
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print("Saved plot to:", out_png)
-
-    return {
-        "cluster": cluster_id,
-        "n_cmd": len(cmd_ids),
-        "n_pm": len(pm_ids),
-        "n_aen": len(aen_ids),
-        "n_dir": len(dir_ids),
-        "n_all": len(all_ids),
-        "n_strong": len(strong_ids)
-    }
-
-
-if __name__=="__main__":
-    vot_dir = "/Users/aroosha/Desktop/mine/uni/astro/AKU/Gaia/BinarySystems/Members-Fractionage/members"
-    save_dir = "/Users/aroosha/Desktop/mine/uni/astro/AKU/Gaia/BinarySystems/Binaries/CombinedBinaries"
-    os.makedirs(save_dir, exist_ok=True)
-
-    results = []
-    for file in glob.glob(os.path.join(vot_dir,"*.vot")):
-        res = process_cluster(file, save_dir)
-        if res:
-            results.append(res)
-
-    if results:
-        summary_csv = os.path.join(save_dir,"summary.csv")
-        pd.DataFrame(results).to_csv(summary_csv, index=False)
-        print("\n📊 Summary saved to:", summary_csv)
-
+    sigma = 1.4826 * np.median(np.abs(aen_nonan - med))
+    
+    # Fallback to standard deviation if data lacks dispersion
+    if sigma <= 0 or not np.isfinite(sigma): 
+        sigma = np.nanstd(aen_nonan) if np.nanstd(aen_nonan) > 0 else 0.01
+        
+    threshold = med + k_sigma * sigma
+    return list(df[df[col] > threshold].index)
